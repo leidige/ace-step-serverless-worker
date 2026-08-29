@@ -17,13 +17,29 @@ import runpod
 MODELS_ROOT = Path(os.environ.get("ACESTEP_MODELS_DIR", "/runpod-volume/models/acestep"))
 HF_REPO = os.environ.get("ACESTEP_HF_REPO", "ACE-Step/Ace-Step1.5")
 DIT_NAME = os.environ.get("ACESTEP_CONFIG_PATH", "acestep-v15-turbo")
-LM_NAME = os.environ.get("ACESTEP_LM_MODEL_PATH", "acestep-5Hz-lm-0.6B")
+# HF repo ACE-Step/Ace-Step1.5 currently ships 1.7B LM (no 0.6B folder).
+LM_NAME = os.environ.get("ACESTEP_LM_MODEL_PATH", "acestep-5Hz-lm-1.7B")
 
 _dit_handler = None
 
 
 def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
+
+
+def _real_weight_files(dit_dir: Path) -> list[Path]:
+    """Ignore tiny HF LFS pointer stubs; turbo weights are multi-GB."""
+    if not dit_dir.is_dir():
+        return []
+    out: list[Path] = []
+    for pat in ("*.safetensors", "*.bin", "*.pt"):
+        for p in dit_dir.rglob(pat):
+            try:
+                if p.is_file() and p.stat().st_size > 1_000_000:
+                    out.append(p)
+            except OSError:
+                continue
+    return out
 
 
 def ensure_volume_layout() -> Path:
@@ -63,18 +79,38 @@ def download_models(force: bool = False) -> dict[str, Any]:
         local_dir_use_symlinks=False,
         allow_patterns=patterns,
     )
-    # Some HF layouts nest under Ace-Step1.5/; flatten if needed
-    nested = ckpt / "acestep-v15-turbo"
-    if not nested.exists():
-        for child in ckpt.rglob("acestep-v15-turbo"):
+    dit_dir = ckpt / DIT_NAME
+    if not dit_dir.exists():
+        for child in ckpt.rglob(DIT_NAME):
             if child.is_dir():
-                log(f"Found nested turbo at {child}")
+                log(f"Found nested {DIT_NAME} at {child}")
                 break
+    # Require real weights (>1MB), not HF LFS pointer stubs
+    weight_hits = _real_weight_files(dit_dir)
+    if not dit_dir.is_dir() or not weight_hits:
+        sizes = {
+            str(p): p.stat().st_size
+            for p in dit_dir.rglob("*")
+            if p.is_file()
+        } if dit_dir.is_dir() else {}
+        raise RuntimeError(
+            f"Download incomplete: {dit_dir} missing real weights after snapshot_download "
+            f"(patterns={patterns}, files={sizes})"
+        )
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(str(time.time()), encoding="utf-8")
     elapsed = round(time.time() - t0, 1)
-    log(f"Download done in {elapsed}s")
-    return {"status": "downloaded", "models_dir": str(ckpt), "seconds": elapsed, "dit": DIT_NAME, "lm": LM_NAME}
+    total_gb = round(sum(p.stat().st_size for p in weight_hits) / (1024**3), 2)
+    log(f"Download done in {elapsed}s files={len(weight_hits)} total_gb={total_gb}")
+    return {
+        "status": "downloaded",
+        "models_dir": str(ckpt),
+        "seconds": elapsed,
+        "dit": DIT_NAME,
+        "lm": LM_NAME,
+        "weight_files": len(weight_hits),
+        "weight_gb": total_gb,
+    }
 
 
 def get_dit_handler():
@@ -84,7 +120,7 @@ def get_dit_handler():
 
     ensure_volume_layout()
     # Prefer volume checkpoints; fall back to baked /app paths
-    project_root = Path(os.environ.get("ACESTEP_PROJECT_ROOT", "/app/acestep-repo"))
+    project_root = Path(os.environ.get("ACESTEP_PROJECT_ROOT", "/runpod-volume/app/acestep-repo"))
     volume_ckpt = Path(os.environ["ACESTEP_CHECKPOINT_DIR"])
     if (volume_ckpt / DIT_NAME).exists():
         # Symlink into expected checkpoints location if package expects ./checkpoints
@@ -219,11 +255,25 @@ def handler(event: dict) -> dict:
         if action in ("setup", "download", "health"):
             if action == "health":
                 ensure_volume_layout()
-                dit_ok = (Path(os.environ["ACESTEP_CHECKPOINT_DIR"]) / DIT_NAME).exists()
+                dit_dir = Path(os.environ["ACESTEP_CHECKPOINT_DIR"]) / DIT_NAME
+                weight_hits = _real_weight_files(dit_dir)
+                rp = Path("/runpod-volume")
+                ws = Path("/workspace")
                 return {
                     "status": "ok",
                     "volume": str(MODELS_ROOT),
-                    "dit_present": dit_ok,
+                    "checkpoint_dir": os.environ.get("ACESTEP_CHECKPOINT_DIR"),
+                    "dit_present": bool(weight_hits),
+                    "dit_weight_files": len(weight_hits),
+                    "dit_weight_gb": round(sum(p.stat().st_size for p in weight_hits) / (1024**3), 2)
+                    if weight_hits
+                    else 0,
+                    "runpod_volume_entries": sorted(p.name for p in rp.iterdir())[:20]
+                    if rp.is_dir()
+                    else [],
+                    "workspace_entries": sorted(p.name for p in ws.iterdir())[:20]
+                    if ws.is_dir()
+                    else [],
                     "cuda": _cuda_ok(),
                 }
             info = download_models(force=bool(data.get("force")))
