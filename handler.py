@@ -16,7 +16,7 @@ from typing import Any
 import runpod
 
 # Bump with every worker fix so health/init_check prove the live handler code.
-HANDLER_REV = "v6-diffusers-032"
+HANDLER_REV = "v7-hf-hub"
 BOOT_REV_ENV = os.environ.get("ACESTEP_BOOT_REV", "").strip() or HANDLER_REV
 
 MODELS_ROOT = Path(os.environ.get("ACESTEP_MODELS_DIR", "") or "")
@@ -507,6 +507,45 @@ def run_cover(input_data: dict) -> dict:
     }
 
 
+def _diffusers_health() -> dict[str, Any]:
+    """Report whether AutoencoderOobleck imports; surface bootstrap fail flag."""
+    out: dict[str, Any] = {
+        "diffusers_ok": False,
+        "diffusers_version": None,
+        "huggingface_hub_version": None,
+        "autoencoder_oobleck_ok": False,
+        "diffusers_error": None,
+        "bootstrap_fail_flag": None,
+    }
+    root = Path(os.environ.get("ACESTEP_VOLUME_ROOT", "") or "/runpod-volume")
+    fail_path = root / "app" / ".ace_diffusers_fail"
+    if fail_path.is_file():
+        try:
+            out["bootstrap_fail_flag"] = fail_path.read_text(encoding="utf-8", errors="replace")[
+                :800
+            ]
+        except OSError as e:
+            out["bootstrap_fail_flag"] = str(e)
+    try:
+        import huggingface_hub
+
+        out["huggingface_hub_version"] = getattr(huggingface_hub, "__version__", "?")
+    except Exception as e:
+        out["diffusers_error"] = f"huggingface_hub import: {e}"
+        return out
+    try:
+        import diffusers
+
+        out["diffusers_version"] = getattr(diffusers, "__version__", "?")
+        from diffusers.models import AutoencoderOobleck  # noqa: F401
+
+        out["autoencoder_oobleck_ok"] = True
+        out["diffusers_ok"] = out["diffusers_version"] == "0.32.2"
+    except Exception as e:
+        out["diffusers_error"] = str(e)[:800]
+    return out
+
+
 def _health_payload() -> dict[str, Any]:
     root = bind_volume_paths()
     ckpt = ensure_volume_layout()
@@ -528,8 +567,14 @@ def _health_payload() -> dict[str, Any]:
 
     rp = Path("/runpod-volume")
     ws = Path("/workspace")
+    diff_h = _diffusers_health()
+    status = "ok"
+    if missing:
+        status = "incomplete"
+    if not diff_h.get("diffusers_ok"):
+        status = "diffusers_broken"
     return {
-        "status": "ok" if not missing else "incomplete",
+        "status": status,
         **_rev_fields(),
         "volume_root": str(root),
         "volume": str(MODELS_ROOT),
@@ -552,6 +597,7 @@ def _health_payload() -> dict[str, Any]:
         "workspace_entries": sorted(p.name for p in ws.iterdir())[:20]
         if ws.is_dir()
         else [],
+        **diff_h,
         **_cuda_info(),
     }
 

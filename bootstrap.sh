@@ -39,11 +39,12 @@ export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 export PATH="${ACESTEP_VENV}/bin:${PATH}"
 
-# v6-diffusers-032: pin diffusers 0.32.2 (has AutoencoderOobleck, no FA3 ace_step custom_op path)
-# Prior "repair" wrongly installed 0.34.0 which still hits torch 2.4 infer_schema crash.
-BOOT_REV="v6-diffusers-032"
+# v7-hf-hub: diffusers 0.32.2 needs huggingface_hub>=0.24 (volume often stuck on 0.23.0).
+# Prior v6 pinned 0.32.2 but repair only reinstalled diffusers → Oobleck import still FATAL.
+BOOT_REV="v7-hf-hub"
 export ACESTEP_BOOT_REV="$BOOT_REV"
 MARKER="$VOL_ROOT/app/.ace_bootstrap_ok"
+DIFFUSERS_FAIL="$VOL_ROOT/app/.ace_diffusers_fail"
 HANDLER_DST="$VOL_ROOT/app/handler.py"
 mkdir -p "$VOL_ROOT/app" "$VOL_ROOT/models/acestep/checkpoints" /app "$HF_HOME"
 
@@ -109,7 +110,7 @@ if [ "$NEED_FULL" = "1" ]; then
     xxhash \
     "typer-slim>=0.21.1" \
     "runpod>=1.7.0" \
-    "huggingface_hub>=0.25.0" \
+    "huggingface_hub>=0.24.0,<1.0" \
     "hf_transfer>=0.1.0"
 else
   log "Reusing volume bootstrap (marker present)."
@@ -212,10 +213,18 @@ PY
 _clear_diffusers_modules() {
   python - <<'PY'
 import sys
+prefixes = (
+    "diffusers",
+    "huggingface_hub",
+    "transformers",
+    "tokenizers",
+)
 for k in list(sys.modules):
-    if k == "diffusers" or k.startswith("diffusers."):
-        del sys.modules[k]
-print("cleared diffusers modules", flush=True)
+    for p in prefixes:
+        if k == p or k.startswith(p + "."):
+            del sys.modules[k]
+            break
+print("cleared diffusers/hf_hub/transformers modules", flush=True)
 PY
 }
 
@@ -223,6 +232,21 @@ _verify_diffusers_oobleck() {
   python - <<'PY'
 import importlib.util
 import sys
+
+import huggingface_hub
+hf_ver = getattr(huggingface_hub, "__version__", "?")
+print("huggingface_hub", hf_ver, flush=True)
+# diffusers 0.32.x requires huggingface-hub>=0.24.0,<1.0
+parts = []
+for x in str(hf_ver).split("."):
+    if x.isdigit():
+        parts.append(int(x))
+    else:
+        break
+maj = parts[0] if parts else -1
+minr = parts[1] if len(parts) > 1 else 0
+if maj != 0 or minr < 24:
+    raise SystemExit(f"huggingface_hub too old for diffusers 0.32.2: {hf_ver}")
 
 # Prove pin: 0.32.2 has AutoencoderOobleck; must NOT pull FA3 ace_step custom_op path.
 import diffusers
@@ -248,30 +272,46 @@ PY
 fix_diffusers() {
   # Newest diffusers (0.34+) registers FA3 custom_ops with from __future__ annotations;
   # torch 2.4 infer_schema rejects that → VAE AutoencoderOobleck import dies.
-  # ALWAYS force 0.32.2 (has Oobleck, no that FA3 import chain on VAE path).
+  # ALWAYS force 0.32.2 + huggingface_hub>=0.24 (volume often has hub 0.23.0).
+  rm -f "$DIFFUSERS_FAIL" 2>/dev/null || true
   CUR="$(python -c "import diffusers; print(diffusers.__version__)" 2>/dev/null || echo none)"
+  HF_CUR="$(python -c "import huggingface_hub; print(huggingface_hub.__version__)" 2>/dev/null || echo none)"
   if [ "$CUR" = "0.32.2" ] && _verify_diffusers_oobleck >/dev/null 2>&1; then
-    log "diffusers $CUR AutoencoderOobleck OK"
+    log "diffusers $CUR + huggingface_hub $HF_CUR AutoencoderOobleck OK"
     return 0
   fi
-  log "Force-pinning diffusers==0.32.2 (have=$CUR) — NOT 0.34.x..."
+  log "Force-pinning diffusers==0.32.2 + huggingface_hub>=0.24 + transformers (have diffusers=$CUR hub=$HF_CUR)..."
   _clear_diffusers_modules || true
   pip uninstall -y diffusers 2>/dev/null || true
+  pip install --no-cache-dir --upgrade \
+    "huggingface_hub>=0.24.0,<1.0" \
+    "transformers>=4.51.0,<4.58.0"
   pip install --force-reinstall --no-cache-dir "diffusers==0.32.2"
+  # Re-assert hub/transformers after force-reinstall (pip may have pulled a dep conflict)
+  pip install --no-cache-dir --upgrade \
+    "huggingface_hub>=0.24.0,<1.0" \
+    "transformers>=4.51.0,<4.58.0"
   _clear_diffusers_modules || true
   if _verify_diffusers_oobleck; then
-    log "diffusers repaired → 0.32.2"
-  else
-    log "FATAL: diffusers==0.32.2 still cannot import AutoencoderOobleck"
-    exit 1
+    log "diffusers repaired → 0.32.2 (hub/transformers pinned)"
+    return 0
   fi
+  # Do NOT exit 1 — crash-loop burns GPU $. Start handler so health can report clearly.
+  ERR_MSG="$( _verify_diffusers_oobleck 2>&1 || true )"
+  log "WARNING: diffusers repair incomplete — starting handler for health error (not FATAL exit)"
+  printf '%s\n' "$ERR_MSG" > "$DIFFUSERS_FAIL" || true
+  return 1
 }
 
 fix_torchaudio
 fix_torchao
-fix_diffusers
-echo "$BOOT_REV" > "$MARKER"
-log "BOOT_REV=$BOOT_REV written to marker"
+if fix_diffusers; then
+  echo "$BOOT_REV" > "$MARKER"
+  log "BOOT_REV=$BOOT_REV written to marker"
+else
+  rm -f "$MARKER" 2>/dev/null || true
+  log "BOOT marker NOT written — next cold start will re-repair"
+fi
 
 export PYTHONPATH="${ACESTEP_PROJECT_ROOT}:${PYTHONPATH:-}"
 export ACESTEP_BOOT_REV="$BOOT_REV"
