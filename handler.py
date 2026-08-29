@@ -318,7 +318,7 @@ def handler(event: dict) -> dict:
                     "workspace_entries": sorted(p.name for p in ws.iterdir())[:20]
                     if ws.is_dir()
                     else [],
-                    "cuda": _cuda_ok(),
+                    **_cuda_info(),
                 }
             info = download_models(force=bool(data.get("force")))
             return {"success": True, **info}
@@ -351,6 +351,22 @@ def _cuda_ok() -> bool:
         return bool(torch.cuda.is_available())
     except Exception:
         return False
+
+
+def _cuda_info() -> dict[str, Any]:
+    info: dict[str, Any] = {"cuda": False}
+    try:
+        import torch
+
+        info["torch"] = getattr(torch, "__version__", None)
+        info["torch_cuda_build"] = getattr(getattr(torch, "version", None), "cuda", None)
+        info["device_count"] = int(torch.cuda.device_count())
+        info["cuda"] = bool(torch.cuda.is_available())
+        if info["cuda"]:
+            info["device0"] = torch.cuda.get_device_name(0)
+    except Exception as e:
+        info["error"] = str(e)
+    return info
 
 
 if __name__ == "__main__":
