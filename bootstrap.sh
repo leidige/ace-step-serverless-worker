@@ -9,7 +9,7 @@ export ACESTEP_VENV="${ACESTEP_VENV:-/runpod-volume/app/venv}"
 export ACESTEP_MODELS_DIR="${ACESTEP_MODELS_DIR:-/runpod-volume/models/acestep}"
 export ACESTEP_CHECKPOINT_DIR="${ACESTEP_CHECKPOINT_DIR:-/runpod-volume/models/acestep/checkpoints}"
 export ACESTEP_CONFIG_PATH="${ACESTEP_CONFIG_PATH:-acestep-v15-turbo}"
-export ACESTEP_LM_MODEL_PATH="${ACESTEP_LM_MODEL_PATH:-acestep-5Hz-lm-0.6B}"
+export ACESTEP_LM_MODEL_PATH="${ACESTEP_LM_MODEL_PATH:-acestep-5Hz-lm-1.7B}"
 export ACESTEP_DEVICE="${ACESTEP_DEVICE:-cuda}"
 export ACESTEP_OFFLOAD="${ACESTEP_OFFLOAD:-0}"
 export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
@@ -80,13 +80,10 @@ else
   log "Reusing volume bootstrap (marker present)."
   # shellcheck disable=SC1091
   source "${ACESTEP_VENV}/bin/activate" || true
-  if [ -f "$HANDLER_DST" ]; then
-    cp -f "$HANDLER_DST" /app/handler.py
-  else
-    curl -fsSL -o /app/handler.py \
-      "https://raw.githubusercontent.com/leidige/ace-step-serverless-worker/master/handler.py"
-    cp -f /app/handler.py "$HANDLER_DST"
-  fi
+  # Always refresh handler from GitHub so hotfixes apply without wiping the venv
+  curl -fsSL -o /app/handler.py \
+    "https://raw.githubusercontent.com/leidige/ace-step-serverless-worker/master/handler.py"
+  cp -f /app/handler.py "$HANDLER_DST" || true
 fi
 
 export PYTHONPATH="${ACESTEP_PROJECT_ROOT}:${PYTHONPATH:-}"
