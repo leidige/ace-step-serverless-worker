@@ -39,8 +39,8 @@ export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 export PATH="${ACESTEP_VENV}/bin:${PATH}"
 
-# v5: pin/repair diffusers — newest FA3 custom_op breaks on torch 2.4 (future annotations)
-BOOT_REV="v5-diffusers-torch24"
+# v6: torchao pin 0.5.0 (newer needs torch.int1 / torch 2.5+) + diffusers pin for torch 2.4
+BOOT_REV="v6-torchao05-diffusers"
 MARKER="$VOL_ROOT/app/.ace_bootstrap_ok"
 HANDLER_DST="$VOL_ROOT/app/handler.py"
 mkdir -p "$VOL_ROOT/app" "$VOL_ROOT/models/acestep/checkpoints" /app "$HF_HOME"
@@ -100,6 +100,7 @@ if [ "$NEED_FULL" = "1" ]; then
     diskcache \
     "numba>=0.63.1" \
     "vector-quantize-pytorch>=1.27.15" \
+    "torchao==0.5.0" \
     toml \
     modelscope \
     "peft>=0.18.0" \
@@ -121,33 +122,6 @@ cp -f /app/handler.py "$HANDLER_DST" || true
 
 # shellcheck disable=SC1091
 source "${ACESTEP_VENV}/bin/activate" || true
-
-# torchao>=0.7 needs torch.int1 (torch>=2.5). Base image is torch 2.4.1.
-fix_torchao() {
-  if python - <<'PY' >/dev/null 2>&1
-import torch
-import torchao
-# Import path that ACE/transformers hits; fail if torch.int1 missing
-from torchao.quantization import quant_primitives  # noqa: F401
-print("ok", torchao.__version__, hasattr(torch, "int1"))
-PY
-  then
-    log "torchao OK"
-    return 0
-  fi
-  log "Repairing torchao (pin 0.5.0 for torch 2.4)..."
-  pip uninstall -y torchao 2>/dev/null || true
-  pip install --no-cache-dir "torchao==0.5.0" || true
-  if python - <<'PY' >/dev/null 2>&1
-import torchao
-print(torchao.__version__)
-PY
-  then
-    log "torchao repaired"
-  else
-    log "WARNING: torchao still broken after repair"
-  fi
-}
 
 # Fix broken torchaudio that shadows the base image CUDA build:
 # "Could not load .../torchaudio/lib/libtorchaudio.so"
@@ -191,24 +165,20 @@ PY
   fi
 }
 
-# torchao>=0.10 needs torch.int1 (PyTorch 2.5+). Base image is 2.4 → DiT load crashes:
-# AttributeError: module 'torch' has no attribute 'int1'
-# Cover path does not need torchao quantization — remove it so transformers can load.
+# transformers eagerly imports torchao; torchao>=0.7 needs torch.int1 (torch>=2.5).
+# Base image is torch 2.4.1 — pin 0.5.0 so DiT load does not crash.
 fix_torchao() {
-  if ! python -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('torchao') else 1)" 2>/dev/null; then
-    log "torchao not installed (OK)"
-    return 0
-  fi
   if python - <<'PY' >/dev/null 2>&1
 import torch
-assert hasattr(torch, "int1"), "no torch.int1"
-import torchao  # noqa: F401
+import torchao
+from torchao.quantization import quant_primitives  # noqa: F401
+print("ok", getattr(torchao, "__version__", "?"))
 PY
   then
-    log "torchao compatible with this torch"
+    log "torchao OK"
     return 0
   fi
-  log "Uninstalling incompatible torchao (torch lacks int1)..."
+  log "Repairing torchao → 0.5.0 (torch 2.4 compat)..."
   pip uninstall -y torchao 2>/dev/null || true
   python - <<'PY'
 import glob, os, shutil, site
@@ -223,15 +193,19 @@ for sp in site.getsitepackages():
             except OSError:
                 pass
 PY
-  if python -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('torchao') is None else 1)" 2>/dev/null; then
-    log "torchao removed"
+  pip install --no-cache-dir "torchao==0.5.0" || true
+  if python - <<'PY' >/dev/null 2>&1
+import torchao
+from torchao.quantization import quant_primitives  # noqa: F401
+print(torchao.__version__)
+PY
+  then
+    log "torchao repaired"
   else
-    log "WARNING: torchao still present after uninstall"
+    log "WARNING: torchao still broken after repair"
   fi
 }
 
-fix_torchaudio
-fix_torchao
 fix_diffusers() {
   # Newest diffusers registers FA3 custom_ops with from __future__ annotations;
   # torch 2.4 infer_schema rejects that → VAE AutoencoderOobleck import dies.
@@ -269,6 +243,8 @@ PY
     log "WARNING: diffusers still broken after repair — handler will try custom_op patch"
   fi
 }
+fix_torchaudio
+fix_torchao
 fix_diffusers
 echo "$BOOT_REV" > "$MARKER"
 

@@ -344,9 +344,10 @@ def get_dit_handler():
         )
 
     link_info = ensure_ace_checkpoints_link(volume_ckpt)
-    patch_ace_project_root(volume_ckpt)
+    # MUST patch torch BEFORE importing AceStepHandler (pulls transformers→torchao)
     patch_torch_int1_compat()
     patch_torch_custom_op_compat()
+    patch_ace_project_root(volume_ckpt)
     log(f"checkpoint bind: {link_info}")
 
     log("Loading DiT...")
