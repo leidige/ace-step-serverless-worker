@@ -39,6 +39,7 @@ export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 export PATH="${ACESTEP_VENV}/bin:${PATH}"
 
+BOOT_REV="v3-torchaudio-fix"
 MARKER="$VOL_ROOT/app/.ace_bootstrap_ok"
 HANDLER_DST="$VOL_ROOT/app/handler.py"
 mkdir -p "$VOL_ROOT/app" "$VOL_ROOT/models/acestep/checkpoints" /app "$HF_HOME"
@@ -62,7 +63,14 @@ if [ "$need_apt" = "1" ]; then
   rm -rf /var/lib/apt/lists/*
 fi
 
+NEED_FULL=0
 if [ ! -f "$MARKER" ] || [ ! -x "${ACESTEP_VENV}/bin/python" ]; then
+  NEED_FULL=1
+elif [ "$(cat "$MARKER" 2>/dev/null || true)" != "$BOOT_REV" ]; then
+  log "Bootstrap rev mismatch — will repair deps without full wipe."
+fi
+
+if [ "$NEED_FULL" = "1" ]; then
   log "Cold bootstrap on network volume (first time or incomplete)..."
   if [ ! -d "$ACESTEP_PROJECT_ROOT/.git" ]; then
     log "Cloning ACE-Step-1.5..."
@@ -100,21 +108,64 @@ if [ ! -f "$MARKER" ] || [ ! -x "${ACESTEP_VENV}/bin/python" ]; then
     "runpod>=1.7.0" \
     "huggingface_hub>=0.25.0" \
     "hf_transfer>=0.1.0"
-
-  curl -fsSL -o "$HANDLER_DST" \
-    "https://raw.githubusercontent.com/leidige/ace-step-serverless-worker/master/handler.py"
-  cp -f "$HANDLER_DST" /app/handler.py
-  touch "$MARKER"
-  log "Bootstrap complete."
 else
   log "Reusing volume bootstrap (marker present)."
   # shellcheck disable=SC1091
   source "${ACESTEP_VENV}/bin/activate" || true
-  # Always refresh handler from GitHub so hotfixes apply without wiping the venv
-  curl -fsSL -o /app/handler.py \
-    "https://raw.githubusercontent.com/leidige/ace-step-serverless-worker/master/handler.py"
-  cp -f /app/handler.py "$HANDLER_DST" || true
 fi
+
+# Always refresh handler from GitHub
+curl -fsSL -o /app/handler.py \
+  "https://raw.githubusercontent.com/leidige/ace-step-serverless-worker/master/handler.py"
+cp -f /app/handler.py "$HANDLER_DST" || true
+
+# shellcheck disable=SC1091
+source "${ACESTEP_VENV}/bin/activate" || true
+
+# Fix broken torchaudio that shadows the base image CUDA build:
+# "Could not load .../torchaudio/lib/libtorchaudio.so"
+fix_torchaudio() {
+  if python - <<'PY' >/dev/null 2>&1
+import torchaudio
+print("ok", torchaudio.__version__)
+PY
+  then
+    log "torchaudio OK"
+    echo "$BOOT_REV" > "$MARKER"
+    return 0
+  fi
+  log "Repairing torchaudio..."
+  pip uninstall -y torchaudio 2>/dev/null || true
+  python - <<'PY'
+import glob, os, shutil, site
+for sp in site.getsitepackages():
+    for p in glob.glob(os.path.join(sp, "torchaudio*")):
+        print("rm", p, flush=True)
+        if os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+PY
+  TORCH_VER="$(python -c "import torch; print(torch.__version__.split('+')[0])" 2>/dev/null || echo "2.4.0")"
+  pip install --no-cache-dir "torchaudio==${TORCH_VER}" \
+    --index-url https://download.pytorch.org/whl/cu124 \
+    || pip install --no-cache-dir "torchaudio==2.4.1" --index-url https://download.pytorch.org/whl/cu124 \
+    || true
+  if python - <<'PY' >/dev/null 2>&1
+import torchaudio
+print(torchaudio.__version__)
+PY
+  then
+    log "torchaudio repaired"
+  else
+    log "WARNING: torchaudio still broken after repair"
+  fi
+  echo "$BOOT_REV" > "$MARKER"
+}
+fix_torchaudio
 
 export PYTHONPATH="${ACESTEP_PROJECT_ROOT}:${PYTHONPATH:-}"
 exec "${ACESTEP_VENV}/bin/python" -u /app/handler.py
