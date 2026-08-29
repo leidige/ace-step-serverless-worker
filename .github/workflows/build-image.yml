@@ -35,3 +35,31 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/ace-step-serverless-worker:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Make GHCR package public (RunPod pull)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          OWNER="${{ github.repository_owner }}"
+          PKG="ace-step-serverless-worker"
+          # User package
+          gh api --method PATCH \
+            -H "Accept: application/vnd.github+json" \
+            "/user/packages/container/${PKG}" \
+            -f visibility=public \
+            || gh api --method PATCH \
+            -H "Accept: application/vnd.github+json" \
+            "/users/${OWNER}/packages/container/${PKG}" \
+            -f visibility=public \
+            || true
+          # Verify anonymous pull works
+          for i in 1 2 3 4 5; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+              "https://ghcr.io/v2/${OWNER}/${PKG}/manifests/latest" || true)
+            echo "anon_pull_http=$code"
+            if [ "$code" = "200" ] || [ "$code" = "302" ]; then exit 0; fi
+            sleep 5
+          done
+          echo "WARN: package may still be private; check GitHub Packages visibility UI"
