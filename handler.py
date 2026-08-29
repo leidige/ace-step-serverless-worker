@@ -14,7 +14,7 @@ from typing import Any
 
 import runpod
 
-MODELS_ROOT = Path(os.environ.get("ACESTEP_MODELS_DIR", "/runpod-volume/models/acestep"))
+MODELS_ROOT = Path(os.environ.get("ACESTEP_MODELS_DIR", "") or "")
 HF_REPO = os.environ.get("ACESTEP_HF_REPO", "ACE-Step/Ace-Step1.5")
 DIT_NAME = os.environ.get("ACESTEP_CONFIG_PATH", "acestep-v15-turbo")
 # HF repo ACE-Step/Ace-Step1.5 currently ships 1.7B LM (no 0.6B folder).
@@ -25,6 +25,43 @@ _dit_handler = None
 
 def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
+
+
+def detect_volume_root() -> Path:
+    """Serverless usually /runpod-volume; some templates mount network volume at /workspace."""
+    preferred = os.environ.get("ACESTEP_VOLUME_ROOT", "").strip()
+    candidates: list[Path] = []
+    if preferred:
+        candidates.append(Path(preferred))
+    candidates.extend([Path("/runpod-volume"), Path("/workspace")])
+    seen: set[str] = set()
+    for root in candidates:
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not root.is_dir():
+            continue
+        probe = root / ".ace_vol_probe"
+        try:
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return root
+        except OSError:
+            continue
+    return Path("/runpod-volume")
+
+
+def bind_volume_paths() -> Path:
+    global MODELS_ROOT
+    root = detect_volume_root()
+    if not os.environ.get("ACESTEP_MODELS_DIR"):
+        MODELS_ROOT = root / "models" / "acestep"
+    elif not MODELS_ROOT.parts:
+        MODELS_ROOT = Path(os.environ["ACESTEP_MODELS_DIR"])
+    os.environ.setdefault("ACESTEP_VOLUME_ROOT", str(root))
+    os.environ.setdefault("ACESTEP_MODELS_DIR", str(MODELS_ROOT))
+    return root
 
 
 def _real_weight_files(dit_dir: Path) -> list[Path]:
@@ -43,15 +80,18 @@ def _real_weight_files(dit_dir: Path) -> list[Path]:
 
 
 def ensure_volume_layout() -> Path:
+    root = bind_volume_paths()
     MODELS_ROOT.mkdir(parents=True, exist_ok=True)
-    cache = Path("/runpod-volume/.cache/huggingface")
+    cache = root / ".cache" / "huggingface"
     cache.mkdir(parents=True, exist_ok=True)
     os.environ["HF_HOME"] = str(cache)
     os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache / "hub")
+    os.environ["HF_HUB_CACHE"] = str(cache / "hub")
+    os.environ["TRANSFORMERS_CACHE"] = str(cache / "transformers")
     # Point ACE checkpoints dir at the network volume
     ckpt = MODELS_ROOT / "checkpoints"
     ckpt.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("ACESTEP_CHECKPOINT_DIR", str(ckpt))
+    os.environ["ACESTEP_CHECKPOINT_DIR"] = str(ckpt)
     return ckpt
 
 
@@ -228,7 +268,9 @@ def run_cover(input_data: dict) -> dict:
         audio_b64 = base64.b64encode(f.read()).decode("utf-8")
 
     # Persist a copy on volume for debugging
-    out_dir = Path("/runpod-volume/outputs")
+    out_dir = MODELS_ROOT.parent.parent / "outputs"
+    if not out_dir.parent.exists():
+        out_dir = Path(os.environ.get("ACESTEP_VOLUME_ROOT", "/runpod-volume")) / "outputs"
     out_dir.mkdir(parents=True, exist_ok=True)
     dest = out_dir / Path(out_path).name
     try:
@@ -254,6 +296,7 @@ def handler(event: dict) -> dict:
 
         if action in ("setup", "download", "health"):
             if action == "health":
+                root = bind_volume_paths()
                 ensure_volume_layout()
                 dit_dir = Path(os.environ["ACESTEP_CHECKPOINT_DIR"]) / DIT_NAME
                 weight_hits = _real_weight_files(dit_dir)
@@ -261,6 +304,7 @@ def handler(event: dict) -> dict:
                 ws = Path("/workspace")
                 return {
                     "status": "ok",
+                    "volume_root": str(root),
                     "volume": str(MODELS_ROOT),
                     "checkpoint_dir": os.environ.get("ACESTEP_CHECKPOINT_DIR"),
                     "dit_present": bool(weight_hits),
