@@ -301,6 +301,35 @@ def patch_torch_int1_compat() -> None:
     log("patched torch.int1 stub (torch 2.4 compat for torchao)")
 
 
+def patch_torch_custom_op_compat() -> None:
+    """
+    Newer diffusers FA3 custom_ops use postponed annotations; torch 2.4
+    infer_schema then raises ValueError and breaks AutoencoderOobleck import.
+    Skip failing registrations — SDPA path still works.
+    """
+    import torch
+
+    if getattr(torch.library, "_ace_custom_op_patched", False):
+        return
+    orig = torch.library.custom_op
+
+    def _wrapped(*args, **kwargs):
+        deco = orig(*args, **kwargs)
+
+        def _inner(fn):
+            try:
+                return deco(fn)
+            except (ValueError, TypeError) as e:
+                log(f"skip torch.library.custom_op (torch compat): {e}")
+                return fn
+
+        return _inner
+
+    torch.library.custom_op = _wrapped  # type: ignore[method-assign]
+    torch.library._ace_custom_op_patched = True  # type: ignore[attr-defined]
+    log("patched torch.library.custom_op for diffusers/torch 2.4")
+
+
 def get_dit_handler():
     global _dit_handler
     if _dit_handler is not None:
@@ -317,6 +346,7 @@ def get_dit_handler():
     link_info = ensure_ace_checkpoints_link(volume_ckpt)
     patch_ace_project_root(volume_ckpt)
     patch_torch_int1_compat()
+    patch_torch_custom_op_compat()
     log(f"checkpoint bind: {link_info}")
 
     log("Loading DiT...")

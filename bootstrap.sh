@@ -39,8 +39,8 @@ export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 export PATH="${ACESTEP_VENV}/bin:${PATH}"
 
-# v4: torchao on torch 2.4 breaks DiT load (torch.int1 missing) — do not install torchao
-BOOT_REV="v4-no-torchao-int1"
+# v5: pin/repair diffusers — newest FA3 custom_op breaks on torch 2.4 (future annotations)
+BOOT_REV="v5-diffusers-torch24"
 MARKER="$VOL_ROOT/app/.ace_bootstrap_ok"
 HANDLER_DST="$VOL_ROOT/app/handler.py"
 mkdir -p "$VOL_ROOT/app" "$VOL_ROOT/models/acestep/checkpoints" /app "$HF_HOME"
@@ -90,7 +90,7 @@ if [ "$NEED_FULL" = "1" ]; then
   pip install --no-cache-dir -e "$ACESTEP_PROJECT_ROOT" --no-deps
   pip install --no-cache-dir \
     "transformers>=4.51.0,<4.58.0" \
-    diffusers \
+    "diffusers>=0.32.0,<0.35.0" \
     "matplotlib>=3.7.5" \
     "scipy>=1.10.1" \
     "soundfile>=0.13.1" \
@@ -121,6 +121,33 @@ cp -f /app/handler.py "$HANDLER_DST" || true
 
 # shellcheck disable=SC1091
 source "${ACESTEP_VENV}/bin/activate" || true
+
+# torchao>=0.7 needs torch.int1 (torch>=2.5). Base image is torch 2.4.1.
+fix_torchao() {
+  if python - <<'PY' >/dev/null 2>&1
+import torch
+import torchao
+# Import path that ACE/transformers hits; fail if torch.int1 missing
+from torchao.quantization import quant_primitives  # noqa: F401
+print("ok", torchao.__version__, hasattr(torch, "int1"))
+PY
+  then
+    log "torchao OK"
+    return 0
+  fi
+  log "Repairing torchao (pin 0.5.0 for torch 2.4)..."
+  pip uninstall -y torchao 2>/dev/null || true
+  pip install --no-cache-dir "torchao==0.5.0" || true
+  if python - <<'PY' >/dev/null 2>&1
+import torchao
+print(torchao.__version__)
+PY
+  then
+    log "torchao repaired"
+  else
+    log "WARNING: torchao still broken after repair"
+  fi
+}
 
 # Fix broken torchaudio that shadows the base image CUDA build:
 # "Could not load .../torchaudio/lib/libtorchaudio.so"
@@ -205,6 +232,44 @@ PY
 
 fix_torchaudio
 fix_torchao
+fix_diffusers() {
+  # Newest diffusers registers FA3 custom_ops with from __future__ annotations;
+  # torch 2.4 infer_schema rejects that → VAE AutoencoderOobleck import dies.
+  if python - <<'PY' >/dev/null 2>&1
+from diffusers.models import AutoencoderOobleck  # noqa: F401
+print("ok")
+PY
+  then
+    log "diffusers AutoencoderOobleck OK"
+    return 0
+  fi
+  log "Repairing diffusers for torch 2.4..."
+  python - <<'PY'
+import sys
+for k in list(sys.modules):
+    if k == "diffusers" or k.startswith("diffusers."):
+        del sys.modules[k]
+print("cleared diffusers modules", flush=True)
+PY
+  pip uninstall -y diffusers 2>/dev/null || true
+  pip install --no-cache-dir "diffusers==0.34.0" || pip install --no-cache-dir "diffusers==0.33.1" || true
+  python - <<'PY'
+import sys
+for k in list(sys.modules):
+    if k == "diffusers" or k.startswith("diffusers."):
+        del sys.modules[k]
+PY
+  if python - <<'PY' >/dev/null 2>&1
+from diffusers.models import AutoencoderOobleck  # noqa: F401
+print("ok")
+PY
+  then
+    log "diffusers repaired"
+  else
+    log "WARNING: diffusers still broken after repair — handler will try custom_op patch"
+  fi
+}
+fix_diffusers
 echo "$BOOT_REV" > "$MARKER"
 
 export PYTHONPATH="${ACESTEP_PROJECT_ROOT}:${PYTHONPATH:-}"
