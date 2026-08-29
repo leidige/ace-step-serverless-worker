@@ -290,6 +290,17 @@ def _assert_handler_ready(handler: Any) -> None:
         )
 
 
+def patch_torch_int1_compat() -> None:
+    """torchao import needs torch.int1 (PyTorch 2.5+); stub on 2.4 so transformers can load."""
+    import torch
+
+    if hasattr(torch, "int1"):
+        return
+    # Import-only stub; Cover does not use torchao quantization.
+    torch.int1 = torch.int8  # type: ignore[attr-defined]
+    log("patched torch.int1 stub (torch 2.4 compat for torchao)")
+
+
 def get_dit_handler():
     global _dit_handler
     if _dit_handler is not None:
@@ -305,6 +316,7 @@ def get_dit_handler():
 
     link_info = ensure_ace_checkpoints_link(volume_ckpt)
     patch_ace_project_root(volume_ckpt)
+    patch_torch_int1_compat()
     log(f"checkpoint bind: {link_info}")
 
     log("Loading DiT...")
