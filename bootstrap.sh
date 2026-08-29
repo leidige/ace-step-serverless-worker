@@ -39,7 +39,8 @@ export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 export PATH="${ACESTEP_VENV}/bin:${PATH}"
 
-BOOT_REV="v3-torchaudio-fix"
+# v4: torchao on torch 2.4 breaks DiT load (torch.int1 missing) — do not install torchao
+BOOT_REV="v4-no-torchao-int1"
 MARKER="$VOL_ROOT/app/.ace_bootstrap_ok"
 HANDLER_DST="$VOL_ROOT/app/handler.py"
 mkdir -p "$VOL_ROOT/app" "$VOL_ROOT/models/acestep/checkpoints" /app "$HF_HOME"
@@ -99,7 +100,6 @@ if [ "$NEED_FULL" = "1" ]; then
     diskcache \
     "numba>=0.63.1" \
     "vector-quantize-pytorch>=1.27.15" \
-    torchao \
     toml \
     modelscope \
     "peft>=0.18.0" \
@@ -131,7 +131,6 @@ print("ok", torchaudio.__version__)
 PY
   then
     log "torchaudio OK"
-    echo "$BOOT_REV" > "$MARKER"
     return 0
   fi
   log "Repairing torchaudio..."
@@ -163,9 +162,50 @@ PY
   else
     log "WARNING: torchaudio still broken after repair"
   fi
-  echo "$BOOT_REV" > "$MARKER"
 }
+
+# torchao>=0.10 needs torch.int1 (PyTorch 2.5+). Base image is 2.4 → DiT load crashes:
+# AttributeError: module 'torch' has no attribute 'int1'
+# Cover path does not need torchao quantization — remove it so transformers can load.
+fix_torchao() {
+  if ! python -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('torchao') else 1)" 2>/dev/null; then
+    log "torchao not installed (OK)"
+    return 0
+  fi
+  if python - <<'PY' >/dev/null 2>&1
+import torch
+assert hasattr(torch, "int1"), "no torch.int1"
+import torchao  # noqa: F401
+PY
+  then
+    log "torchao compatible with this torch"
+    return 0
+  fi
+  log "Uninstalling incompatible torchao (torch lacks int1)..."
+  pip uninstall -y torchao 2>/dev/null || true
+  python - <<'PY'
+import glob, os, shutil, site
+for sp in site.getsitepackages():
+    for p in glob.glob(os.path.join(sp, "torchao*")):
+        print("rm", p, flush=True)
+        if os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+PY
+  if python -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('torchao') is None else 1)" 2>/dev/null; then
+    log "torchao removed"
+  else
+    log "WARNING: torchao still present after uninstall"
+  fi
+}
+
 fix_torchaudio
+fix_torchao
+echo "$BOOT_REV" > "$MARKER"
 
 export PYTHONPATH="${ACESTEP_PROJECT_ROOT}:${PYTHONPATH:-}"
 exec "${ACESTEP_VENV}/bin/python" -u /app/handler.py
