@@ -39,8 +39,10 @@ export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 export PATH="${ACESTEP_VENV}/bin:${PATH}"
 
-# v6: torchao pin 0.5.0 (newer needs torch.int1 / torch 2.5+) + diffusers pin for torch 2.4
-BOOT_REV="v6-torchao05-diffusers"
+# v6-diffusers-032: pin diffusers 0.32.2 (has AutoencoderOobleck, no FA3 ace_step custom_op path)
+# Prior "repair" wrongly installed 0.34.0 which still hits torch 2.4 infer_schema crash.
+BOOT_REV="v6-diffusers-032"
+export ACESTEP_BOOT_REV="$BOOT_REV"
 MARKER="$VOL_ROOT/app/.ace_bootstrap_ok"
 HANDLER_DST="$VOL_ROOT/app/handler.py"
 mkdir -p "$VOL_ROOT/app" "$VOL_ROOT/models/acestep/checkpoints" /app "$HF_HOME"
@@ -90,7 +92,7 @@ if [ "$NEED_FULL" = "1" ]; then
   pip install --no-cache-dir -e "$ACESTEP_PROJECT_ROOT" --no-deps
   pip install --no-cache-dir \
     "transformers>=4.51.0,<4.58.0" \
-    "diffusers>=0.32.0,<0.35.0" \
+    "diffusers==0.32.2" \
     "matplotlib>=3.7.5" \
     "scipy>=1.10.1" \
     "soundfile>=0.13.1" \
@@ -115,9 +117,10 @@ else
   source "${ACESTEP_VENV}/bin/activate" || true
 fi
 
-# Always refresh handler from GitHub
-curl -fsSL -o /app/handler.py \
-  "https://raw.githubusercontent.com/leidige/ace-step-serverless-worker/master/handler.py"
+# Always refresh handler from GitHub (cache-bust query so CDN cannot serve stale handler.py)
+HANDLER_URL="https://raw.githubusercontent.com/leidige/ace-step-serverless-worker/master/handler.py?t=${BOOT_REV}"
+log "Fetching handler: $HANDLER_URL"
+curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" -o /app/handler.py "$HANDLER_URL"
 cp -f /app/handler.py "$HANDLER_DST" || true
 
 # shellcheck disable=SC1091
@@ -206,18 +209,7 @@ PY
   fi
 }
 
-fix_diffusers() {
-  # Newest diffusers registers FA3 custom_ops with from __future__ annotations;
-  # torch 2.4 infer_schema rejects that → VAE AutoencoderOobleck import dies.
-  if python - <<'PY' >/dev/null 2>&1
-from diffusers.models import AutoencoderOobleck  # noqa: F401
-print("ok")
-PY
-  then
-    log "diffusers AutoencoderOobleck OK"
-    return 0
-  fi
-  log "Repairing diffusers for torch 2.4..."
+_clear_diffusers_modules() {
   python - <<'PY'
 import sys
 for k in list(sys.modules):
@@ -225,28 +217,62 @@ for k in list(sys.modules):
         del sys.modules[k]
 print("cleared diffusers modules", flush=True)
 PY
-  pip uninstall -y diffusers 2>/dev/null || true
-  pip install --no-cache-dir "diffusers==0.34.0" || pip install --no-cache-dir "diffusers==0.33.1" || true
+}
+
+_verify_diffusers_oobleck() {
   python - <<'PY'
+import importlib.util
 import sys
-for k in list(sys.modules):
-    if k == "diffusers" or k.startswith("diffusers."):
-        del sys.modules[k]
-PY
-  if python - <<'PY' >/dev/null 2>&1
+
+# Prove pin: 0.32.2 has AutoencoderOobleck; must NOT pull FA3 ace_step custom_op path.
+import diffusers
+ver = getattr(diffusers, "__version__", "?")
+print("diffusers", ver, flush=True)
+if ver != "0.32.2":
+    raise SystemExit(f"expected diffusers==0.32.2 got {ver}")
+
+# Hard fail if ace_step_transformer is importable as a side-effect of models.__init__
+# (0.34+ registers FA3 @_custom_op that breaks torch 2.4 infer_schema).
 from diffusers.models import AutoencoderOobleck  # noqa: F401
-print("ok")
+print("AutoencoderOobleck OK", flush=True)
+
+spec = importlib.util.find_spec("diffusers.models.transformers.transformer_ace_step")
+if spec is not None:
+    # Module file may exist in newer trees; importing it is the crash. Ensure we did not.
+    if "diffusers.models.transformers.transformer_ace_step" in sys.modules:
+        raise SystemExit("ace_step transformer already imported — wrong diffusers pin")
+print("ace_step_transformer not loaded — OK", flush=True)
 PY
-  then
-    log "diffusers repaired"
+}
+
+fix_diffusers() {
+  # Newest diffusers (0.34+) registers FA3 custom_ops with from __future__ annotations;
+  # torch 2.4 infer_schema rejects that → VAE AutoencoderOobleck import dies.
+  # ALWAYS force 0.32.2 (has Oobleck, no that FA3 import chain on VAE path).
+  CUR="$(python -c "import diffusers; print(diffusers.__version__)" 2>/dev/null || echo none)"
+  if [ "$CUR" = "0.32.2" ] && _verify_diffusers_oobleck >/dev/null 2>&1; then
+    log "diffusers $CUR AutoencoderOobleck OK"
+    return 0
+  fi
+  log "Force-pinning diffusers==0.32.2 (have=$CUR) — NOT 0.34.x..."
+  _clear_diffusers_modules || true
+  pip uninstall -y diffusers 2>/dev/null || true
+  pip install --force-reinstall --no-cache-dir "diffusers==0.32.2"
+  _clear_diffusers_modules || true
+  if _verify_diffusers_oobleck; then
+    log "diffusers repaired → 0.32.2"
   else
-    log "WARNING: diffusers still broken after repair — handler will try custom_op patch"
+    log "FATAL: diffusers==0.32.2 still cannot import AutoencoderOobleck"
+    exit 1
   fi
 }
+
 fix_torchaudio
 fix_torchao
 fix_diffusers
 echo "$BOOT_REV" > "$MARKER"
+log "BOOT_REV=$BOOT_REV written to marker"
 
 export PYTHONPATH="${ACESTEP_PROJECT_ROOT}:${PYTHONPATH:-}"
+export ACESTEP_BOOT_REV="$BOOT_REV"
 exec "${ACESTEP_VENV}/bin/python" -u /app/handler.py

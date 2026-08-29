@@ -15,6 +15,10 @@ from typing import Any
 
 import runpod
 
+# Bump with every worker fix so health/init_check prove the live handler code.
+HANDLER_REV = "v6-diffusers-032"
+BOOT_REV_ENV = os.environ.get("ACESTEP_BOOT_REV", "").strip() or HANDLER_REV
+
 MODELS_ROOT = Path(os.environ.get("ACESTEP_MODELS_DIR", "") or "")
 HF_REPO = os.environ.get("ACESTEP_HF_REPO", "ACE-Step/Ace-Step1.5")
 DIT_NAME = os.environ.get("ACESTEP_CONFIG_PATH", "acestep-v15-turbo")
@@ -31,6 +35,14 @@ _dit_handler = None
 
 def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
+
+
+def _rev_fields() -> dict[str, Any]:
+    return {
+        "handler_rev": HANDLER_REV,
+        "BOOT": BOOT_REV_ENV,
+        "boot_rev": BOOT_REV_ENV,
+    }
 
 
 def detect_volume_root() -> Path:
@@ -306,28 +318,49 @@ def patch_torch_custom_op_compat() -> None:
     Newer diffusers FA3 custom_ops use postponed annotations; torch 2.4
     infer_schema then raises ValueError and breaks AutoencoderOobleck import.
     Skip failing registrations — SDPA path still works.
+    Patch both torch.library.custom_op and torch._library.custom_ops.custom_op
+    (diffusers may bind either).
     """
     import torch
 
     if getattr(torch.library, "_ace_custom_op_patched", False):
         return
-    orig = torch.library.custom_op
 
-    def _wrapped(*args, **kwargs):
-        deco = orig(*args, **kwargs)
+    def _wrap_custom_op(orig):
+        def _wrapped(*args, **kwargs):
+            deco = orig(*args, **kwargs)
 
-        def _inner(fn):
-            try:
-                return deco(fn)
-            except (ValueError, TypeError) as e:
-                log(f"skip torch.library.custom_op (torch compat): {e}")
-                return fn
+            def _inner(fn):
+                try:
+                    return deco(fn)
+                except (ValueError, TypeError) as e:
+                    log(f"skip custom_op (torch compat): {e}")
+                    return fn
 
-        return _inner
+            return _inner
 
-    torch.library.custom_op = _wrapped  # type: ignore[method-assign]
+        return _wrapped
+
+    torch.library.custom_op = _wrap_custom_op(torch.library.custom_op)  # type: ignore[method-assign]
+    try:
+        import torch._library.custom_ops as _cos
+
+        if hasattr(_cos, "custom_op"):
+            _cos.custom_op = _wrap_custom_op(_cos.custom_op)  # type: ignore[method-assign]
+            log("patched torch._library.custom_ops.custom_op")
+    except Exception as e:
+        log(f"torch._library.custom_ops patch skipped: {e}")
+
     torch.library._ace_custom_op_patched = True  # type: ignore[attr-defined]
     log("patched torch.library.custom_op for diffusers/torch 2.4")
+
+
+# Apply torch compat patches at import time — before any AceStep/diffusers import.
+try:
+    patch_torch_int1_compat()
+    patch_torch_custom_op_compat()
+except Exception as _early_patch_err:
+    log(f"early torch compat patch failed: {_early_patch_err}")
 
 
 def get_dit_handler():
@@ -497,6 +530,7 @@ def _health_payload() -> dict[str, Any]:
     ws = Path("/workspace")
     return {
         "status": "ok" if not missing else "incomplete",
+        **_rev_fields(),
         "volume_root": str(root),
         "volume": str(MODELS_ROOT),
         "checkpoint_dir": os.environ.get("ACESTEP_CHECKPOINT_DIR"),
@@ -544,6 +578,7 @@ def handler(event: dict) -> dict:
             dit = get_dit_handler()
             return {
                 "success": True,
+                **_rev_fields(),
                 "model": dit.model is not None,
                 "vae": dit.vae is not None,
                 "text_tokenizer": dit.text_tokenizer is not None,
@@ -581,5 +616,8 @@ def _cuda_info() -> dict[str, Any]:
 
 if __name__ == "__main__":
     ensure_volume_layout()
-    log("ACE-Step Serverless worker starting (volume-first models)")
+    log(
+        f"ACE-Step Serverless worker starting handler_rev={HANDLER_REV} "
+        f"BOOT={BOOT_REV_ENV} (volume-first models)"
+    )
     runpod.serverless.start({"handler": handler})
