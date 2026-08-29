@@ -1,0 +1,44 @@
+name: Make GHCR package public
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/make-package-public.yml"
+
+permissions:
+  packages: write
+  contents: read
+
+jobs:
+  public:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set package visibility to public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          NAME="ace-step-serverless-worker"
+          # Prefer org/user packages API
+          code=$(curl -sS -o /tmp/vis.json -w "%{http_code}" -X PUT \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/user/packages/container/${NAME}/visibility" \
+            -d '{"visibility":"public"}')
+          echo "HTTP $code"
+          cat /tmp/vis.json || true
+          if [ "$code" != "204" ] && [ "$code" != "200" ]; then
+            # Fallback: package linked to repo
+            code2=$(curl -sS -o /tmp/vis2.json -w "%{http_code}" -X PUT \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/user/packages/container/${NAME}/visibility" \
+              -d '{"visibility":"public"}')
+            echo "retry HTTP $code2"
+            cat /tmp/vis2.json || true
+            [ "$code2" = "204" ] || [ "$code2" = "200" ] || exit 1
+          fi
+          echo "PACKAGE_PUBLIC_OK"
