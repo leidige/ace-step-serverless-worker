@@ -4,22 +4,52 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export PYTHONUNBUFFERED=1
-export ACESTEP_PROJECT_ROOT="${ACESTEP_PROJECT_ROOT:-/runpod-volume/app/acestep-repo}"
-export ACESTEP_VENV="${ACESTEP_VENV:-/runpod-volume/app/venv}"
-export ACESTEP_MODELS_DIR="${ACESTEP_MODELS_DIR:-/runpod-volume/models/acestep}"
-export ACESTEP_CHECKPOINT_DIR="${ACESTEP_CHECKPOINT_DIR:-/runpod-volume/models/acestep/checkpoints}"
+
+log() { echo "[ace-bootstrap] $*" >&2; }
+
+# Detect network volume mount: serverless often /runpod-volume; some templates use /workspace.
+detect_root() {
+  for d in /runpod-volume /workspace; do
+    if [ -d "$d" ] && touch "$d/.ace_vol_probe" 2>/dev/null; then
+      rm -f "$d/.ace_vol_probe"
+      echo "$d"
+      return 0
+    fi
+  done
+  mkdir -p /runpod-volume
+  echo /runpod-volume
+}
+
+VOL_ROOT="$(detect_root)"
+export ACESTEP_VOLUME_ROOT="$VOL_ROOT"
+log "Using volume root: $VOL_ROOT"
+
+export ACESTEP_PROJECT_ROOT="${ACESTEP_PROJECT_ROOT:-$VOL_ROOT/app/acestep-repo}"
+export ACESTEP_VENV="${ACESTEP_VENV:-$VOL_ROOT/app/venv}"
+export ACESTEP_MODELS_DIR="${ACESTEP_MODELS_DIR:-$VOL_ROOT/models/acestep}"
+export ACESTEP_CHECKPOINT_DIR="${ACESTEP_CHECKPOINT_DIR:-$VOL_ROOT/models/acestep/checkpoints}"
 export ACESTEP_CONFIG_PATH="${ACESTEP_CONFIG_PATH:-acestep-v15-turbo}"
 export ACESTEP_LM_MODEL_PATH="${ACESTEP_LM_MODEL_PATH:-acestep-5Hz-lm-1.7B}"
 export ACESTEP_DEVICE="${ACESTEP_DEVICE:-cuda}"
 export ACESTEP_OFFLOAD="${ACESTEP_OFFLOAD:-0}"
 export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
+export HF_HOME="${HF_HOME:-$VOL_ROOT/.cache/huggingface}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 export PATH="${ACESTEP_VENV}/bin:${PATH}"
 
-MARKER=/runpod-volume/app/.ace_bootstrap_ok
-HANDLER_DST=/runpod-volume/app/handler.py
-mkdir -p /runpod-volume/app /runpod-volume/models/acestep/checkpoints /app
+MARKER="$VOL_ROOT/app/.ace_bootstrap_ok"
+HANDLER_DST="$VOL_ROOT/app/handler.py"
+mkdir -p "$VOL_ROOT/app" "$VOL_ROOT/models/acestep/checkpoints" /app "$HF_HOME"
 
-log() { echo "[ace-bootstrap] $*" >&2; }
+# Keep /runpod-volume path usable even when mount is /workspace
+if [ "$VOL_ROOT" = "/workspace" ]; then
+  mkdir -p /runpod-volume
+  ln -sfn /workspace/app /runpod-volume/app 2>/dev/null || true
+  ln -sfn /workspace/models /runpod-volume/models 2>/dev/null || true
+  ln -sfn /workspace/.cache /runpod-volume/.cache 2>/dev/null || true
+fi
 
 need_apt=0
 command -v git >/dev/null 2>&1 || need_apt=1
